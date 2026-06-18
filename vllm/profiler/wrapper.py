@@ -197,27 +197,19 @@ class TorchProfilerWrapper(WorkerProfiler):
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
 
-        # Create profiler schedule if warmup or wait iterations are configured
-        profiler_schedule = None
-        if profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0:
-            profiler_schedule = torch.profiler.schedule(
-                skip_first=0,
-                wait=profiler_config.wait_iterations,
-                warmup=profiler_config.warmup_iterations,
-                active=profiler_config.active_iterations,
-                repeat=1,
+        # Log schedule configuration once if applicable.
+        if (
+            profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0
+        ) and local_rank in (None, 0):
+            logger.info_once(
+                "Profiler schedule configured: wait=%d, warmup=%d, active=%d",
+                profiler_config.wait_iterations,
+                profiler_config.warmup_iterations,
+                profiler_config.active_iterations,
             )
-            if local_rank in (None, 0):
-                logger.info_once(
-                    "Profiler schedule configured: wait=%d, warmup=%d, active=%d",
-                    profiler_config.wait_iterations,
-                    profiler_config.warmup_iterations,
-                    profiler_config.active_iterations,
-                )
 
-        self.profiler = torch.profiler.profile(
+        self._profile_factory_kwargs: dict = dict(
             activities=[TorchProfilerActivityMap[activity] for activity in activities],
-            schedule=profiler_schedule,
             record_shapes=profiler_config.torch_profiler_record_shapes,
             profile_memory=profiler_config.torch_profiler_with_memory,
             with_stack=profiler_config.torch_profiler_with_stack,
@@ -225,15 +217,38 @@ class TorchProfilerWrapper(WorkerProfiler):
             on_trace_ready=trace_handler,
         )
 
-        # Track if we're using a schedule (need to call step())
-        self._uses_schedule = profiler_schedule is not None
+        # Whether the user configured a schedule — the actual schedule object
+        # is rebuilt for every round inside _build_profiler().
+        self._uses_schedule = (
+            profiler_config.warmup_iterations > 0 or profiler_config.wait_iterations > 0
+        )
         self._warmup_iterations = profiler_config.warmup_iterations
-        # Subtract 1 because profiler.start() already consumes step 0
-        # (WAIT or WARMUP), so only wait + warmup - 1 non-active steps
-        # remain to be advanced through via profiler.step() calls.
-        self._warmup_steps_remaining = max(
-            profiler_config.wait_iterations + profiler_config.warmup_iterations - 1,
-            0,
+
+        # The actual torch.profiler.profile instance — created lazily per round
+        # in _start() and discarded in _stop().
+        self.profiler: torch.profiler.profile | None = None
+        # Initial value; reset on each _start() (see _start()).
+        self._warmup_steps_remaining = 0
+
+    def _build_profiler(self) -> "torch.profiler.profile":
+        """Construct a fresh torch.profiler.profile object.
+
+        Called on every _start() to comply with PyTorch's contract that
+        torch.profiler.profile is a one-shot context manager. See the note in
+        __init__ for the full rationale.
+        """
+        profiler_schedule = None
+        if self._uses_schedule:
+            profiler_schedule = torch.profiler.schedule(
+                skip_first=0,
+                wait=self.profiler_config.wait_iterations,
+                warmup=self.profiler_config.warmup_iterations,
+                active=self.profiler_config.active_iterations,
+                repeat=1,
+            )
+        return torch.profiler.profile(
+            schedule=profiler_schedule,
+            **self._profile_factory_kwargs,
         )
 
     def _build_profiler_table(
@@ -241,6 +256,10 @@ class TorchProfilerWrapper(WorkerProfiler):
         sort_key: str,
         row_limit: int | None = None,
     ) -> str:
+        # Only called from _stop() while the profiler is alive.
+        assert self.profiler is not None, (
+            "Profiler table requested but profiler is not running."
+        )
         if row_limit is None:  # use profiler default row limit of 100
             return self.profiler.key_averages().table(sort_by=sort_key)
         return self.profiler.key_averages().table(
@@ -260,10 +279,26 @@ class TorchProfilerWrapper(WorkerProfiler):
 
     @override
     def _start(self) -> None:
+        # Build a fresh torch.profiler.profile object for this round.
+        # See the note in __init__ for why we cannot reuse the same object.
+        self.profiler = self._build_profiler()
+        # Reset schedule warmup counter for this round.
+        # Subtract 1 because profiler.start() already consumes step 0
+        # (WAIT or WARMUP), so only wait + warmup - 1 non-active steps
+        # remain to be advanced through via profiler.step() calls.
+        self._warmup_steps_remaining = max(
+            self.profiler_config.wait_iterations
+            + self.profiler_config.warmup_iterations
+            - 1,
+            0,
+        )
         self.profiler.start()
 
     @override
     def _stop(self) -> None:
+        assert self.profiler is not None, (
+            "Profiler is not running; _stop called without a matching _start."
+        )
         self.profiler.stop()
 
         profiler_config = self.profiler_config
@@ -286,6 +321,10 @@ class TorchProfilerWrapper(WorkerProfiler):
             if rank == 0:
                 print(table)
 
+        # Discard the one-shot profiler object so a fresh one is built next
+        # round. See the note in __init__.
+        self.profiler = None
+
     @override
     def _profiler_step(self) -> bool:
         """Call profiler.step() when using schedule-based profiling.
@@ -295,6 +334,9 @@ class TorchProfilerWrapper(WorkerProfiler):
             False if the step was a warmup step (data discarded).
         """
         if self._uses_schedule:
+            assert self.profiler is not None, (
+                "Profiler step called but profiler is not running."
+            )
             self.profiler.step()
             # Track warmup steps - only count active steps toward max_iterations
             if self._warmup_steps_remaining > 0:
